@@ -1,3 +1,92 @@
+
+const triangleVertWGSL = `@vertex
+fn main(
+  @builtin(vertex_index) VertexIndex : u32
+) -> @builtin(position) vec4f {
+  var pos = array<vec2f, 3>(
+    vec2(0.0, 0.5),
+    vec2(-0.5, -0.5),
+    vec2(0.5, -0.5)
+  );
+
+  return vec4f(pos[VertexIndex], 0.0, 1.0);
+}`;
+
+const redFragWGSL = `@fragment
+fn main() -> @location(0) vec4f {
+  return vec4(1.0, 0.0, 0.0, 1.0);
+}`;
+
+var theCanvas = null;
+
+async function initGPU() {
+  const canvas = new OffscreenCanvas(640, 480);
+  const adapter = await navigator.gpu?.requestAdapter();
+  const device = await adapter?.requestDevice();
+
+  const context = canvas.getContext('webgpu');
+  theCanvas = canvas;
+
+  const devicePixelRatio = window.devicePixelRatio;
+  const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+
+  context.configure({
+    device,
+    format: presentationFormat,
+  });
+
+  const pipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: {
+      module: device.createShaderModule({
+        code: triangleVertWGSL,
+      }),
+    },
+    fragment: {
+      module: device.createShaderModule({
+        code: redFragWGSL,
+      }),
+      targets: [
+        {
+          format: presentationFormat,
+        },
+      ],
+    },
+    primitive: {
+      topology: 'triangle-list',
+    },
+  });
+
+  function frame() {
+    const commandEncoder = device.createCommandEncoder();
+    const textureView = context.getCurrentTexture().createView();
+
+    const renderPassDescriptor = {
+      colorAttachments: [
+        {
+          view: textureView,
+          clearValue: [0, 0, 0, 0], // Clear to transparent
+          loadOp: 'clear',
+          storeOp: 'store',
+        },
+      ],
+    };
+
+    const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+    passEncoder.setPipeline(pipeline);
+    passEncoder.draw(3);
+    passEncoder.end();
+
+    device.queue.submit([commandEncoder.finish()]);
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+}
+
+initGPU();
+
+
 // Config variables: change them to point to your own servers
 const SIGNALING_SERVER_URL = 'http://localhost:9999';
 const TURN_SERVER_URL = 'localhost:3478';
@@ -41,18 +130,39 @@ let sendData = (data) => {
 
 // WebRTC methods
 let pc;
-let localStream;
+let localTrack;
 let remoteStreamElement = document.querySelector('#remoteStream');
 let localStreamElement = document.querySelector('#localStream');
 
+
+var timestamp = 0;
+async function transform(frame, controller) {
+  const gpuFrame = new VideoFrame(theCanvas, { timestamp: timestamp, alpha: 'discard' });
+  timestamp += 1000;
+
+  controller.enqueue(gpuFrame);
+  frame.close();
+}
+
 let getLocalStream = () => {
-  navigator.mediaDevices.getUserMedia({ audio: true, video: true })
+
+    navigator.mediaDevices.getUserMedia({
+        video: {
+            width: { min: 1280, ideal: 1920, max: 1920 },
+            height: { min: 720, ideal: 1080, max: 1080 },
+            facingMode: "user",
+        },
+
+        audio: false })
+
     .then((stream) => {
       console.log('Stream found');
-      localStream = stream;
-      // Disable the microphone by default
-      stream.getAudioTracks()[0].enabled = false;
-      localStreamElement.srcObject = localStream;
+
+      const mstp = new MediaStreamTrackProcessor({track: stream.getVideoTracks()[0]});
+      const mstg = new MediaStreamTrackGenerator({kind: "video"});
+      mstp.readable.pipeThrough(new TransformStream({transform})).pipeTo(mstg.writable);
+      localStreamElement.srcObject = new MediaStream([mstg]);
+      localTrack = mstg;
       // Connect after making sure that local stream is availble
       socket.connect();
     })
@@ -66,7 +176,9 @@ let createPeerConnection = () => {
     pc = new RTCPeerConnection(PC_CONFIG);
     pc.onicecandidate = onIceCandidate;
     pc.ontrack = onTrack;
-    pc.addStream(localStream);
+    pc.onnegotiationneeded = onNegotiationNeeded;
+    pc.addTrack(localTrack);
+
     console.log('PeerConnection created');
   } catch (error) {
     console.error('PeerConnection failed: ', error);
@@ -106,8 +218,13 @@ let onIceCandidate = (event) => {
 };
 
 let onTrack = (event) => {
-  console.log('Add track');
-  remoteStreamElement.srcObject = event.streams[0];
+  console.log('Add track', event);
+  const stream = new MediaStream([event.track]);
+  remoteStreamElement.srcObject = stream;
+};
+
+let onNegotiationNeeded = (event) => {
+  console.log('Negotiation neeeded');
 };
 
 let handleSignalingData = (data) => {
@@ -124,13 +241,6 @@ let handleSignalingData = (data) => {
       pc.addIceCandidate(new RTCIceCandidate(data.candidate));
       break;
   }
-};
-
-let toggleMic = () => {
-  let track = localStream.getAudioTracks()[0];
-  track.enabled = !track.enabled;
-  let micClass = track.enabled ? "unmuted" : "muted";
-  document.getElementById("toggleMic").className = micClass;
 };
 
 // Start connection
